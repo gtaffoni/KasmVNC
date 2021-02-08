@@ -1,15 +1,15 @@
 /* Copyright (C) 2002-2005 RealVNC Ltd.  All Rights Reserved.
- * 
+ *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
- * 
+ *
  * This software is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU General Public License
  * along with this software; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307,
@@ -478,10 +478,18 @@ WebsocketListener::WebsocketListener(const struct sockaddr *listenaddr,
   struct sockaddr_un addr;
   addr.sun_family = AF_UNIX;
   strcpy(addr.sun_path, ".KasmVNCSock");
+  int sun_path_len = sizeof(".KasmVNCSock");
+  char* port=getenv("SOCKET_PORT");
+  if(port!=NULL){
+         printf("PORT tcp: %s\n",port);
+         strcat(addr.sun_path,".");
+         strcat(addr.sun_path,port);
+         sun_path_len += strlen(port);
+    }
+  printf("Socket tcp: %s\n",addr.sun_path);
   addr.sun_path[0] = '\0';
-
   if (bind(internalSocket, (struct sockaddr *) &addr,
-           sizeof(sa_family_t) + sizeof(".KasmVNCSock"))) {
+           sizeof(sa_family_t) + sun_path_len)) {
     throw SocketException("failed to bind socket", errorNumber);
   }
 

@@ -225,6 +225,15 @@ void proxy_handler(ws_ctx_t *ws_ctx) {
     struct sockaddr_un addr;
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, ".KasmVNCSock");
+    int sun_path_len = sizeof(".KasmVNCSock");
+    char* port=getenv("SOCKET_PORT");
+    if(port!=NULL){
+         printf("PORT web: %s\n",port);
+         strcat(addr.sun_path,".");
+         strcat(addr.sun_path,port);
+         sun_path_len += strlen(port);
+    }
+    printf("Socket web: %s\n",addr.sun_path);
     addr.sun_path[0] = '\0';
 
     int tsock = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -232,7 +241,7 @@ void proxy_handler(ws_ctx_t *ws_ctx) {
     handler_msg("connecting to VNC target\n");
 
     if (connect(tsock, (struct sockaddr *) &addr,
-        sizeof(sa_family_t) + sizeof(".KasmVNCSock")) < 0) {
+      sizeof(sa_family_t) + sun_path_len) < 0) {
 
         handler_emsg("Could not connect to target: %s\n",
                      strerror(errno));
@@ -354,7 +363,7 @@ int main(int argc, char *argv[])
     //printf("  cert: %s\n",      settings.cert);
     //printf("  key: %s\n",       settings.key);
 
-    settings.handler = proxy_handler; 
+    settings.handler = proxy_handler;
     start_server();
 
 }
