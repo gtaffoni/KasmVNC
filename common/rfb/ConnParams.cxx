@@ -24,8 +24,10 @@
 #include <rfb/Exception.h>
 #include <rfb/encodings.h>
 #include <rfb/ledStates.h>
+#include <rfb/clipboardTypes.h>
 #include <rfb/ConnParams.h>
 #include <rfb/ServerCore.h>
+#include <rfb/SMsgHandler.h>
 #include <rfb/util.h>
 
 using namespace rfb;
@@ -35,19 +37,25 @@ ConnParams::ConnParams()
     width(0), height(0), useCopyRect(false),
     supportsLocalCursor(false), supportsLocalXCursor(false),
     supportsLocalCursorWithAlpha(false),
+    supportsCursorPosition(false),
     supportsDesktopResize(false), supportsExtendedDesktopSize(false),
     supportsDesktopRename(false), supportsLastRect(false),
     supportsLEDState(false), supportsQEMUKeyEvent(false),
     supportsWEBP(false),
     supportsSetDesktopSize(false), supportsFence(false),
-    supportsContinuousUpdates(false),
+    supportsContinuousUpdates(false), supportsExtendedClipboard(false),
     compressLevel(2), qualityLevel(-1), fineQualityLevel(-1),
-    subsampling(subsampleUndefined), name_(0), verStrPos(0),
-    ledState_(ledUnknown)
+    subsampling(subsampleUndefined), name_(0), cursorPos_(0, 0), verStrPos(0),
+    ledState_(ledUnknown), shandler(NULL)
 {
   memset(kasmPassed, 0, KASM_NUM_SETTINGS);
   setName("");
   cursor_ = new Cursor(0, 0, Point(), NULL);
+
+  clipFlags = clipboardUTF8 | clipboardRTF | clipboardHTML |
+              clipboardRequest | clipboardNotify | clipboardProvide;
+  memset(clipSizes, 0, sizeof(clipSizes));
+  clipSizes[0] = 20 * 1024 * 1024;
 }
 
 ConnParams::~ConnParams()
@@ -100,6 +108,11 @@ void ConnParams::setCursor(const Cursor& other)
   cursor_ = new Cursor(other);
 }
 
+void ConnParams::setCursorPos(const Point& pos)
+{
+    cursorPos_ = pos;
+}
+
 bool ConnParams::supportsEncoding(rdr::S32 encoding) const
 {
   return encodings_.count(encoding) != 0;
@@ -124,6 +137,8 @@ void ConnParams::setEncodings(int nEncodings, const rdr::S32* encodings)
   encodings_.clear();
   encodings_.insert(encodingRaw);
 
+  bool canChangeSettings = !shandler || shandler->canChangeKasmSettings();
+
   for (int i = nEncodings-1; i >= 0; i--) {
     switch (encodings[i]) {
     case encodingCopyRect:
@@ -143,6 +158,9 @@ void ConnParams::setEncodings(int nEncodings, const rdr::S32* encodings)
       break;
     case pseudoEncodingExtendedDesktopSize:
       supportsExtendedDesktopSize = true;
+      break;
+    case pseudoEncodingVMwareCursorPosition:
+      supportsCursorPosition = true;
       break;
     case pseudoEncodingDesktopName:
       supportsDesktopRename = true;
@@ -165,6 +183,9 @@ void ConnParams::setEncodings(int nEncodings, const rdr::S32* encodings)
     case pseudoEncodingContinuousUpdates:
       supportsContinuousUpdates = true;
       break;
+    case pseudoEncodingExtendedClipboard:
+      supportsExtendedClipboard = true;
+      break;
     case pseudoEncodingSubsamp1X:
       subsampling = subsampleNone;
       break;
@@ -184,11 +205,11 @@ void ConnParams::setEncodings(int nEncodings, const rdr::S32* encodings)
       subsampling = subsample16X;
       break;
     case pseudoEncodingPreferBandwidth:
-      if (!rfb::Server::ignoreClientSettingsKasm)
+      if (!rfb::Server::ignoreClientSettingsKasm && canChangeSettings)
         Server::preferBandwidth.setParam();
       break;
     case pseudoEncodingMaxVideoResolution:
-      if (!rfb::Server::ignoreClientSettingsKasm)
+      if (!rfb::Server::ignoreClientSettingsKasm && canChangeSettings)
         kasmPassed[KASM_MAX_VIDEO_RESOLUTION] = true;
       break;
     }
@@ -205,7 +226,7 @@ void ConnParams::setEncodings(int nEncodings, const rdr::S32* encodings)
         encodings[i] <= pseudoEncodingFineQualityLevel100)
       fineQualityLevel = encodings[i] - pseudoEncodingFineQualityLevel0;
 
-    if (!rfb::Server::ignoreClientSettingsKasm) {
+    if (!rfb::Server::ignoreClientSettingsKasm && canChangeSettings) {
       if (encodings[i] >= pseudoEncodingJpegVideoQualityLevel0 &&
           encodings[i] <= pseudoEncodingJpegVideoQualityLevel9)
           Server::jpegVideoQuality.setParam(encodings[i] - pseudoEncodingJpegVideoQualityLevel0);
@@ -255,4 +276,18 @@ void ConnParams::setEncodings(int nEncodings, const rdr::S32* encodings)
 void ConnParams::setLEDState(unsigned int state)
 {
   ledState_ = state;
+}
+
+void ConnParams::setClipboardCaps(rdr::U32 flags, const rdr::U32* lengths)
+{
+  int i, num;
+
+  clipFlags = flags;
+
+  num = 0;
+  for (i = 0;i < 16;i++) {
+    if (!(flags & (1 << i)))
+      continue;
+    clipSizes[i] = lengths[num++];
+  }
 }

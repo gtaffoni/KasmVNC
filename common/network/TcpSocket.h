@@ -90,7 +90,8 @@ namespace network {
   class WebsocketListener : public SocketListener {
   public:
     WebsocketListener(const struct sockaddr *listenaddr, socklen_t listenaddrlen,
-                      bool sslonly, const char *cert, const char *basicauth,
+                      bool sslonly, const char *cert, const char *certkey,
+                      bool disablebasicauth,
                       const char *httpdir);
 
     virtual int getMyPort();
@@ -99,8 +100,12 @@ namespace network {
 
     int internalSocket;
 
+    virtual GetAPIMessager *getMessager() { return messager; }
+
   protected:
     virtual Socket* createSocket(int fd);
+  private:
+    GetAPIMessager *messager;
   };
 
   void createLocalTcpListeners(std::list<SocketListener*> *listeners,
@@ -110,7 +115,8 @@ namespace network {
                           const char *addr,
                           bool sslonly,
                           const char *cert,
-                          const char *basicauth,
+                          const char *certkey,
+                          bool disablebasicauth,
                           const char *httpdir);
   void createTcpListeners(std::list<SocketListener*> *listeners,
                           const char *addr,
@@ -121,7 +127,8 @@ namespace network {
                           const struct addrinfo *ai,
                           bool sslonly,
                           const char *cert,
-                          const char *basicauth,
+                          const char *certkey,
+                          bool disablebasicauth,
                           const char *httpdir);
 
   typedef struct vnc_sockaddr {

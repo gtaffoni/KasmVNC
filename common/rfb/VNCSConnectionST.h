@@ -75,9 +75,11 @@ namespace rfb {
     void screenLayoutChangeOrClose(rdr::U16 reason);
     void setCursorOrClose();
     void bellOrClose();
-    void serverCutTextOrClose(const char *str, int len);
     void setDesktopNameOrClose(const char *name);
     void setLEDStateOrClose(unsigned int state);
+    void requestClipboardOrClose();
+    void announceClipboardOrClose(bool available);
+    void sendClipboardDataOrClose(const char* data);
 
     // checkIdleTimeout() returns the number of milliseconds left until the
     // idle timeout expires.  If it has expired, the connection is closed and
@@ -97,10 +99,19 @@ namespace rfb {
     // cursor.
     void renderedCursorChange();
 
+    // cursorPositionChange() is called whenever the cursor has changed position by
+    // the server.  If the client supports being informed about these changes then
+    // it will arrange for the new cursor position to be sent to the client.
+    void cursorPositionChange();
+
     // needRenderedCursor() returns true if this client needs the server-side
     // rendered cursor.  This may be because it does not support local cursor
     // or because the current cursor position has not been set by this client.
     bool needRenderedCursor();
+
+    void recheckPerms() {
+        needsPermCheck = true;
+    }
 
     network::Socket* getSock() { return sock; }
     void add_changed(const Region& region) { updates.add_changed(region); }
@@ -164,27 +175,40 @@ namespace rfb {
     virtual void queryConnection(const char* userName);
     virtual void clientInit(bool shared);
     virtual void setPixelFormat(const PixelFormat& pf);
-    virtual void pointerEvent(const Point& pos, int buttonMask);
+    virtual void pointerEvent(const Point& pos, int buttonMask, const bool skipClick, const bool skipRelease);
     virtual void keyEvent(rdr::U32 keysym, rdr::U32 keycode, bool down);
-    virtual void clientCutText(const char* str, int len);
     virtual void framebufferUpdateRequest(const Rect& r, bool incremental);
     virtual void setDesktopSize(int fb_width, int fb_height,
                                 const ScreenSet& layout);
     virtual void fence(rdr::U32 flags, unsigned len, const char data[]);
     virtual void enableContinuousUpdates(bool enable,
                                          int x, int y, int w, int h);
+    virtual void handleClipboardRequest();
+    virtual void handleClipboardAnnounce(bool available);
+    virtual void handleClipboardData(const char* data, int len);
     virtual void supportsLocalCursor();
     virtual void supportsFence();
     virtual void supportsContinuousUpdates();
     virtual void supportsLEDState();
 
     virtual void sendStats();
+    virtual bool canChangeKasmSettings() const {
+        return (accessRights & (AccessPtrEvents | AccessKeyEvents)) ==
+               (AccessPtrEvents | AccessKeyEvents);
+    }
 
     // setAccessRights() allows a security package to limit the access rights
     // of a VNCSConnectioST to the server.  These access rights are applied
     // such that the actual rights granted are the minimum of the server's
     // default access settings and the connection's access settings.
-    virtual void setAccessRights(AccessRights ar) {accessRights=ar;}
+    virtual void setAccessRights(AccessRights ar) {
+        accessRights = ar;
+
+        bool write, owner;
+        if (!getPerms(write, owner) || !write)
+            accessRights &= ~WRITER_PERMS;
+        needsPermCheck = false;
+    }
 
     // Timer callbacks
     virtual bool handleTimeout(Timer* t);
@@ -192,6 +216,8 @@ namespace rfb {
     // Internal methods
 
     bool isShiftPressed();
+
+    bool getPerms(bool &write, bool &owner) const;
 
     // Congestion control
     void writeRTTPing();
@@ -206,6 +232,7 @@ namespace rfb {
 
     void screenLayoutChange(rdr::U16 reason);
     void setCursor();
+    void setCursorPos();
     void setDesktopName(const char *name);
     void setLEDState(unsigned int state);
     void setSocketTimeouts();
@@ -248,6 +275,10 @@ namespace rfb {
     std::list<struct timeval> bstats[BS_NUM]; // Bottleneck stats
     rdr::U64 bstats_total[BS_NUM];
     struct timeval connStart;
+
+    char user[32];
+    char kasmpasswdpath[4096];
+    bool needsPermCheck;
 
     time_t lastEventTime;
     time_t pointerEventTime;

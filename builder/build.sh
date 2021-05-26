@@ -1,5 +1,12 @@
 #!/bin/sh -e
 
+detect_quilt() {
+  if which quilt 1>/dev/null; then
+    QUILT_PRESENT=1
+    export QUILT_PATCHES=debian/patches
+  fi
+}
+
 # For build-dep to work, the apt sources need to have the source server
 #sudo apt-get build-dep xorg-server
 
@@ -7,7 +14,10 @@
 
 # Ubuntu applies a million patches, but here we use upstream to simplify matters
 cd /tmp
-wget https://www.x.org/archive/individual/xserver/xorg-server-1.19.6.tar.bz2
+# default to the version of x in Ubuntu 18.04, otherwise caller will need to specify
+XORG_VER=${XORG_VER:-"1.19.6"}
+XORG_PATCH=$(echo "$XORG_VER" | grep -Po '^\d.\d+' | sed 's#\.##')
+wget https://www.x.org/archive/individual/xserver/xorg-server-${XORG_VER}.tar.bz2
 
 #git clone https://kasmweb@bitbucket.org/kasmtech/kasmvnc.git
 #cd kasmvnc
@@ -20,13 +30,17 @@ sed -i -e '/find_package(FLTK/s@^@#@' \
 	-e '/add_subdirectory(tests/s@^@#@' \
 	CMakeLists.txt
 
-cmake .
+cmake -D CMAKE_BUILD_TYPE=RelWithDebInfo .
 make -j5
 
-tar -C unix/xserver -xvf /tmp/xorg-server-1.19.6.tar.bz2 --strip-components=1
+tar -C unix/xserver -xvf /tmp/xorg-server-${XORG_VER}.tar.bz2 --strip-components=1
 
 cd unix/xserver
-patch -Np1 -i ../xserver119.patch
+patch -Np1 -i ../xserver${XORG_PATCH}.patch
+if [[ $XORG_VER =~ ^1\.20\..*$ ]]; then
+  patch -Np1 -i ../xserver120.7.patch
+fi
+
 autoreconf -i
 # Configuring Xorg is long and has many distro-specific paths.
 # The distro paths start after prefix and end with the font path,
@@ -53,15 +67,20 @@ ln -s /src/unix/xserver/hw/vnc/Xvnc Xvnc
 cd ..
 mkdir -p man/man1
 touch man/man1/Xserver.1
-touch man/man1/Xvnc.1
+cp /src/unix/xserver/hw/vnc/Xvnc.man man/man1/Xvnc.1
 mkdir lib
 cd lib
-ln -s /usr/lib/x86_64-linux-gnu/dri dri
+if [ -d /usr/lib/x86_64-linux-gnu/dri ]; then
+  ln -s /usr/lib/x86_64-linux-gnu/dri dri
+else
+  ln -s /usr/lib64/dri dri
+fi
 cd /src
-sed  $'s#pushd $TMPDIR/inst#CWD=$(pwd)\\\ncd $TMPDIR/inst#' release/maketarball > release/maketarball2
-sed  $'s#popd#cd $CWD#' release/maketarball2 > release/maketarball3
-mv release/maketarball3 release/maketarball
 
+detect_quilt
+if [ -n "$QUILT_PRESENT" ]; then
+  quilt push -a
+fi
 make servertarball
 
-cp kasmvnc*.tar.gz /build/
+cp kasmvnc*.tar.gz /build/kasmvnc.${KASMVNC_BUILD_OS}_${KASMVNC_BUILD_OS_CODENAME}.tar.gz

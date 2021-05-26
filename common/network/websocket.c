@@ -9,8 +9,10 @@
  */
 #define _GNU_SOURCE
 
+#include <ctype.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <crypt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -29,6 +31,7 @@
 #include <openssl/md5.h> /* md5 hash */
 #include <openssl/sha.h> /* sha1 hash */
 #include "websocket.h"
+#include "kasmpasswd.h"
 
 /*
  * Global state
@@ -58,29 +61,78 @@ void fatal(char *msg)
     exit(1);
 }
 
-/* resolve host with also IP address parsing */ 
-int resolve_host(struct in_addr *sin_addr, const char *hostname) 
-{ 
-    if (!inet_aton(hostname, sin_addr)) { 
-        struct addrinfo *ai, *cur; 
-        struct addrinfo hints; 
-        memset(&hints, 0, sizeof(hints)); 
-        hints.ai_family = AF_INET; 
-        if (getaddrinfo(hostname, NULL, &hints, &ai)) 
-            return -1; 
-        for (cur = ai; cur; cur = cur->ai_next) { 
-            if (cur->ai_family == AF_INET) { 
-                *sin_addr = ((struct sockaddr_in *)cur->ai_addr)->sin_addr; 
-                freeaddrinfo(ai); 
-                return 0; 
-            } 
-        } 
-        freeaddrinfo(ai); 
-        return -1; 
-    } 
-    return 0; 
-} 
+/* resolve host with also IP address parsing */
+int resolve_host(struct in_addr *sin_addr, const char *hostname)
+{
+    if (!inet_aton(hostname, sin_addr)) {
+        struct addrinfo *ai, *cur;
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        if (getaddrinfo(hostname, NULL, &hints, &ai))
+            return -1;
+        for (cur = ai; cur; cur = cur->ai_next) {
+            if (cur->ai_family == AF_INET) {
+                *sin_addr = ((struct sockaddr_in *)cur->ai_addr)->sin_addr;
+                freeaddrinfo(ai);
+                return 0;
+            }
+        }
+        freeaddrinfo(ai);
+        return -1;
+    }
+    return 0;
+}
 
+static const char *parse_get(const char * const in, const char * const opt, unsigned *len) {
+	const char *start = in;
+	const char *end = strchrnul(start, '&');
+	const unsigned optlen = strlen(opt);
+	*len = 0;
+
+	while (1) {
+		if (!strncmp(start, opt, optlen)) {
+			const char *arg = strchr(start, '=');
+			if (!arg)
+				return "";
+			arg++;
+			*len = end - arg;
+			return arg;
+		}
+
+		if (!*end)
+			break;
+
+		end++;
+		start = end;
+		end = strchrnul(start, '&');
+	}
+
+	return "";
+}
+
+static void percent_decode(const char *src, char *dst) {
+	while (1) {
+		if (!*src)
+			break;
+		if (*src != '%') {
+			*dst++ = *src++;
+		} else {
+			src++;
+			if (!src[0] || !src[1])
+				break;
+			char hex[3];
+			hex[0] = src[0];
+			hex[1] = src[1];
+			hex[2] = '\0';
+
+			src += 2;
+			*dst++ = strtol(hex, NULL, 16);
+		}
+	}
+
+	*dst = '\0';
+}
 
 /*
  * SSL Wrapper Code
@@ -106,7 +158,7 @@ ssize_t ws_send(ws_ctx_t *ctx, const void *buf, size_t len) {
 
 ws_ctx_t *alloc_ws_ctx() {
     ws_ctx_t *ctx;
-    if (! (ctx = malloc(sizeof(ws_ctx_t))) )
+    if (! (ctx = calloc(sizeof(ws_ctx_t), 1)) )
         { fatal("malloc()"); }
 
     if (! (ctx->cin_buf = malloc(BUFSIZE)) )
@@ -160,11 +212,13 @@ ws_ctx_t *ws_socket_ssl(ws_ctx_t *ctx, int socket, char * certfile, char * keyfi
 
     }
 
-    ctx->ssl_ctx = SSL_CTX_new(TLSv1_server_method());
+    ctx->ssl_ctx = SSL_CTX_new(SSLv23_server_method());
     if (ctx->ssl_ctx == NULL) {
         ERR_print_errors_fp(stderr);
         fatal("Failed to configure SSL context");
     }
+
+    SSL_CTX_set_options(ctx->ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
 
     if (SSL_CTX_use_PrivateKey_file(ctx->ssl_ctx, use_keyfile,
                                     SSL_FILETYPE_PEM) <= 0) {
@@ -305,7 +359,7 @@ int decode_hixie(char *src, size_t srclength,
     *left = srclength;
 
     if (srclength == 2 &&
-        (src[0] == '\xff') && 
+        (src[0] == '\xff') &&
         (src[1] == '\x00')) {
         // client sent orderly close frame
         *opcode = 0x8; // Close frame
@@ -323,7 +377,7 @@ int decode_hixie(char *src, size_t srclength,
             return len;
         }
         retlen += len;
-        start = end + 2; // Skip '\xff' end and '\x00' start 
+        start = end + 2; // Skip '\xff' end and '\x00' start
         framecount++;
     } while (end < (src+srclength-1));
     if (framecount > 1) {
@@ -396,7 +450,7 @@ int decode_hybi(unsigned char *src, size_t srclength,
     int i = 0, len, framecount = 0;
     size_t remaining = 0;
     unsigned int target_offset = 0, hdr_length = 0, payload_length = 0;
-    
+
     *left = srclength;
     frame = src;
 
@@ -496,7 +550,7 @@ int decode_hybi(unsigned char *src, size_t srclength,
         snprintf(cntstr, 3, "%d", framecount);
         traffic(cntstr);
     }
-    
+
     *left = remaining;
     return target_offset;
 }
@@ -540,7 +594,7 @@ int parse_handshake(ws_ctx_t *ws_ctx, char *handshake) {
     end = strstr(start, "\r\n");
     strncpy(headers->origin, start, end-start);
     headers->origin[end-start] = '\0';
-   
+
     start = strstr(handshake, "\r\nSec-WebSocket-Version: ");
     if (start) {
         // HyBi/RFC 6455
@@ -557,14 +611,14 @@ int parse_handshake(ws_ctx_t *ws_ctx, char *handshake) {
         end = strstr(start, "\r\n");
         strncpy(headers->key1, start, end-start);
         headers->key1[end-start] = '\0';
-   
+
         start = strstr(handshake, "\r\nConnection: ");
         if (!start) { return 0; }
         start += 14;
         end = strstr(start, "\r\n");
         strncpy(headers->connection, start, end-start);
         headers->connection[end-start] = '\0';
-   
+
         start = strstr(handshake, "\r\nSec-WebSocket-Protocol: ");
         if (!start) { return 0; }
         start += 26;
@@ -589,7 +643,7 @@ int parse_handshake(ws_ctx_t *ws_ctx, char *handshake) {
             end = strstr(start, "\r\n");
             strncpy(headers->key1, start, end-start);
             headers->key1[end-start] = '\0';
-        
+
             start = strstr(handshake, "\r\nSec-WebSocket-Key2: ");
             if (!start) { return 0; }
             start += 22;
@@ -725,7 +779,13 @@ static void dirlisting(ws_ctx_t *ws_ctx, const char fullpath[], const char path[
         if (!strcmp(names[i]->d_name, ".") || !strcmp(names[i]->d_name, ".."))
             continue;
 
-        sprintf(buf, "<li><a href=\"%s\">%s</a></li>", names[i]->d_name, names[i]->d_name);
+        if (names[i]->d_type == DT_DIR)
+	        sprintf(buf, "<li><a href=\"%s/\">%s/</a></li>", names[i]->d_name,
+	                names[i]->d_name);
+        else
+	        sprintf(buf, "<li><a href=\"%s\">%s</a></li>", names[i]->d_name,
+	                names[i]->d_name);
+
         ws_send(ws_ctx, buf, strlen(buf));
     }
 
@@ -810,6 +870,226 @@ nope:
     ws_send(ws_ctx, buf, strlen(buf));
 }
 
+static uint8_t ownerapi(ws_ctx_t *ws_ctx, const char *in) {
+    char buf[4096], path[4096], args[4096] = "";
+    uint8_t ret = 0; // 0 = continue checking
+
+    if (strncmp(in, "GET ", 4)) {
+        wserr("non-GET request, rejecting\n");
+        return 0;
+    }
+    in += 4;
+    const char *end = strchr(in, ' ');
+    unsigned len = end - in;
+
+    if (len < 1 || len > 1024 || strstr(in, "../")) {
+        wserr("Request too long (%u) or attempted dir traversal attack, rejecting\n", len);
+        return 0;
+    }
+
+    end = memchr(in, '?', len);
+    if (end) {
+        len = end - in;
+        end++;
+
+        const char *argend = strchr(end, ' ');
+        strncpy(args, end, argend - end);
+        args[argend - end] = '\0';
+    }
+
+    memcpy(path, in, len);
+    path[len] = '\0';
+
+    if (strstr(args, "password=")) {
+        wserr("Requested owner api '%s' with args (skipped, includes password)\n", path);
+    } else {
+        wserr("Requested owner api '%s' with args '%s'\n", path, args);
+    }
+
+    #define entry(x) if (!strcmp(path, x))
+
+    const char *param;
+
+    entry("/api/get_screenshot") {
+        uint8_t q = 7, dedup = 0;
+        uint16_t w = 4096, h = 4096;
+
+        param = parse_get(args, "width", &len);
+        if (len && isdigit(param[0]))
+            w = atoi(param);
+
+        param = parse_get(args, "height", &len);
+        if (len && isdigit(param[0]))
+            h = atoi(param);
+
+        param = parse_get(args, "quality", &len);
+        if (len && isdigit(param[0]))
+            q = atoi(param);
+
+        param = parse_get(args, "deduplicate", &len);
+        if (len && isalpha(param[0])) {
+            if (!strncmp(param, "true", len))
+                dedup = 1;
+        }
+
+        uint8_t *staging = malloc(1024 * 1024 * 8);
+
+        settings.screenshotCb(settings.messager, w, h, q, dedup, &len, staging);
+
+        if (len == 16) {
+            sprintf(buf, "HTTP/1.1 200 OK\r\n"
+                     "Server: KasmVNC/4.0\r\n"
+                     "Connection: close\r\n"
+                     "Content-type: text/plain\r\n"
+                     "Content-length: %u\r\n"
+                     "\r\n", len);
+            ws_send(ws_ctx, buf, strlen(buf));
+            ws_send(ws_ctx, staging, len);
+
+            wserr("Screenshot hadn't changed and dedup was requested, sent hash\n");
+            ret = 1;
+        } else if (len) {
+            sprintf(buf, "HTTP/1.1 200 OK\r\n"
+                     "Server: KasmVNC/4.0\r\n"
+                     "Connection: close\r\n"
+                     "Content-type: image/jpeg\r\n"
+                     "Content-length: %u\r\n"
+                     "\r\n", len);
+            ws_send(ws_ctx, buf, strlen(buf));
+            ws_send(ws_ctx, staging, len);
+
+            wserr("Sent screenshot %u bytes\n", len);
+            ret = 1;
+        }
+
+        free(staging);
+
+        if (!len) {
+            wserr("Invalid params to screenshot\n");
+            goto nope;
+        }
+    } else entry("/api/create_user") {
+        char decname[1024] = "", decpw[1024] = "";
+        uint8_t write = 0;
+
+        param = parse_get(args, "name", &len);
+        if (len) {
+            memcpy(buf, param, len);
+            buf[len] = '\0';
+            percent_decode(buf, decname);
+        }
+
+        param = parse_get(args, "password", &len);
+        if (len) {
+            memcpy(buf, param, len);
+            buf[len] = '\0';
+            percent_decode(buf, decpw);
+
+            struct crypt_data cdata;
+            cdata.initialized = 0;
+
+            const char *encrypted = crypt_r(decpw, "$5$kasm$", &cdata);
+            strcpy(decpw, encrypted);
+        }
+
+        param = parse_get(args, "write", &len);
+        if (len && isalpha(param[0])) {
+            if (!strncmp(param, "true", len))
+                write = 1;
+        }
+
+        if (!decname[0] || !decpw[0])
+            goto nope;
+
+        if (!settings.adduserCb(settings.messager, decname, decpw, write)) {
+            wserr("Invalid params to create_user\n");
+            goto nope;
+        }
+
+        sprintf(buf, "HTTP/1.1 200 OK\r\n"
+                 "Server: KasmVNC/4.0\r\n"
+                 "Connection: close\r\n"
+                 "Content-type: text/plain\r\n"
+                 "Content-length: 6\r\n"
+                 "\r\n"
+                 "200 OK");
+        ws_send(ws_ctx, buf, strlen(buf));
+
+        ret = 1;
+    } else entry("/api/remove_user") {
+        char decname[1024] = "";
+
+        param = parse_get(args, "name", &len);
+        if (len) {
+            memcpy(buf, param, len);
+            buf[len] = '\0';
+            percent_decode(buf, decname);
+        }
+
+        if (!decname[0])
+            goto nope;
+
+        if (!settings.removeCb(settings.messager, decname)) {
+            wserr("Invalid params to remove_user\n");
+            goto nope;
+        }
+
+        sprintf(buf, "HTTP/1.1 200 OK\r\n"
+                 "Server: KasmVNC/4.0\r\n"
+                 "Connection: close\r\n"
+                 "Content-type: text/plain\r\n"
+                 "Content-length: 6\r\n"
+                 "\r\n"
+                 "200 OK");
+        ws_send(ws_ctx, buf, strlen(buf));
+
+        wserr("Passed remove_user request to main thread\n");
+        ret = 1;
+    } else entry("/api/give_control") {
+        char decname[1024] = "";
+
+        param = parse_get(args, "name", &len);
+        if (len) {
+            memcpy(buf, param, len);
+            buf[len] = '\0';
+            percent_decode(buf, decname);
+        }
+
+        if (!decname[0])
+            goto nope;
+
+        if (!settings.givecontrolCb(settings.messager, decname)) {
+            wserr("Invalid params to give_control\n");
+            goto nope;
+        }
+
+        sprintf(buf, "HTTP/1.1 200 OK\r\n"
+                 "Server: KasmVNC/4.0\r\n"
+                 "Connection: close\r\n"
+                 "Content-type: text/plain\r\n"
+                 "Content-length: 6\r\n"
+                 "\r\n"
+                 "200 OK");
+        ws_send(ws_ctx, buf, strlen(buf));
+
+        wserr("Passed give_control request to main thread\n");
+        ret = 1;
+    }
+
+    #undef entry
+
+    return ret;
+nope:
+    sprintf(buf, "HTTP/1.1 400 Bad Request\r\n"
+                 "Server: KasmVNC/4.0\r\n"
+                 "Connection: close\r\n"
+                 "Content-type: text/plain\r\n"
+                 "\r\n"
+                 "400 Bad Request");
+    ws_send(ws_ctx, buf, strlen(buf));
+    return 1;
+}
+
 ws_ctx_t *do_handshake(int sock) {
     char handshake[4096], response[4096], sha1[29], trailer[17];
     char *scheme, *pre;
@@ -878,8 +1158,8 @@ ws_ctx_t *do_handshake(int sock) {
         usleep(10);
     }
 
-    const char *colon;
-    if ((colon = strchr(settings.basicauth, ':'))) {
+    unsigned char owner = 0;
+    if (!settings.disablebasicauth) {
         const char *hdr = strstr(handshake, "Authorization: Basic ");
         if (!hdr) {
             handler_emsg("BasicAuth required, but client didn't send any. 401 Unauth\n");
@@ -904,40 +1184,56 @@ ws_ctx_t *do_handshake(int sock) {
         tmp[len] = '\0';
         len = ws_b64_pton(tmp, response, 256);
 
-        char authbuf[4096];
-        strncpy(authbuf, settings.basicauth, 4096);
-        authbuf[4095] = '\0';
+        char authbuf[4096] = "";
 
         // Do we need to read it from the file?
         char *resppw = strchr(response, ':');
         if (resppw && *resppw)
             resppw++;
-        if (!colon[1] && settings.passwdfile) {
-            if (resppw && *resppw) {
+        if (settings.passwdfile) {
+            if (resppw && *resppw && resppw - response < 32) {
                 char pwbuf[4096];
-                FILE *f = fopen(settings.passwdfile, "r");
-                if (f) {
-                    handler_emsg("BasicAuth reading password from %s\n", settings.passwdfile);
-                    const unsigned len = fread(pwbuf, 1, 4096, f);
-                    fclose(f);
-                    pwbuf[4095] = '\0';
-                    if (len < 4096)
-                        pwbuf[len] = '\0';
-
-                    snprintf(authbuf, 4096, "%s%s", settings.basicauth, pwbuf);
-                    authbuf[4095] = '\0';
-
-                    const char *encrypted = crypt(resppw, "$5$kasm$");
-                    *resppw = '\0';
-
-                    snprintf(pwbuf, 4096, "%s%s", response, encrypted);
-                    pwbuf[4095] = '\0';
-                    strcpy(response, pwbuf);
-                } else {
-                    fprintf(stderr, " websocket %d: Error: BasicAuth configured to read password from file %s, but the file doesn't exist\n",
+                struct kasmpasswd_t *set = readkasmpasswd(settings.passwdfile);
+                if (!set->num) {
+                    fprintf(stderr, " websocket %d: Error: BasicAuth configured to read password from file %s, but the file doesn't exist or has no valid users\n",
                             wsthread_handler_id,
                             settings.passwdfile);
+                } else {
+                    unsigned i;
+                    char inuser[32];
+                    unsigned char found = 0;
+                    memcpy(inuser, response, resppw - response - 1);
+                    inuser[resppw - response - 1] = '\0';
+
+                    for (i = 0; i < set->num; i++) {
+                        if (!strcmp(set->entries[i].user, inuser)) {
+                            found = 1;
+                            strcpy(ws_ctx->user, inuser);
+                            snprintf(authbuf, 4096, "%s:%s", set->entries[i].user,
+                                     set->entries[i].password);
+                            authbuf[4095] = '\0';
+
+                            if (set->entries[i].owner)
+                                owner = 1;
+                            break;
+                        }
+                    }
+
+                    if (!found)
+                        handler_emsg("BasicAuth user %s not found\n", inuser);
                 }
+                free(set->entries);
+                free(set);
+
+                struct crypt_data cdata;
+                cdata.initialized = 0;
+
+                const char *encrypted = crypt_r(resppw, "$5$kasm$", &cdata);
+                *resppw = '\0';
+
+                snprintf(pwbuf, 4096, "%s%s", response, encrypted);
+                pwbuf[4095] = '\0';
+                strcpy(response, pwbuf);
             } else {
                 // Client tried an empty password, just fail them
                 response[0] = '\0';
@@ -959,9 +1255,28 @@ ws_ctx_t *do_handshake(int sock) {
     if (!parse_handshake(ws_ctx, handshake)) {
         handler_emsg("Invalid WS request, maybe a HTTP one\n");
 
+        if (strstr(handshake, "/api/")) {
+            handler_emsg("HTTP request under /api/\n");
+
+            if (owner) {
+                if (ownerapi(ws_ctx, handshake))
+                    goto done;
+            } else {
+                sprintf(response, "HTTP/1.1 401 Unauthorized\r\n"
+                        "Server: KasmVNC/4.0\r\n"
+                        "Connection: close\r\n"
+                        "Content-type: text/plain\r\n"
+                        "\r\n"
+                        "401 Unauthorized");
+                ws_send(ws_ctx, response, strlen(response));
+                goto done;
+            }
+        }
+
         if (settings.httpdir && settings.httpdir[0])
             servefile(ws_ctx, handshake);
 
+done:
         free_ws_ctx(ws_ctx);
         return NULL;
     }
@@ -995,7 +1310,7 @@ ws_ctx_t *do_handshake(int sock) {
         snprintf(response, sizeof(response), SERVER_HANDSHAKE_HIXIE, pre, headers->origin,
                  pre, scheme, headers->host, headers->path, pre, "base64", trailer);
     }
-    
+
     //handler_msg("response: %s\n", response);
     ws_send(ws_ctx, response, strlen(response));
 
@@ -1012,7 +1327,6 @@ void *subthread(void *ptr) {
 
     const int csock = pass->csock;
     wsthread_handler_id = pass->id;
-    free((void *) pass);
 
     ws_ctx_t *ws_ctx;
 
@@ -1022,11 +1336,14 @@ void *subthread(void *ptr) {
         goto out;   // Child process exits
     }
 
+    memcpy(ws_ctx->ip, pass->ip, sizeof(pass->ip));
+
     proxy_handler(ws_ctx);
     if (pipe_error) {
         handler_emsg("Closing due to SIGPIPE\n");
     }
 out:
+    free((void *) pass);
 
     if (ws_ctx) {
         ws_socket_free(ws_ctx);
@@ -1062,12 +1379,13 @@ void *start_server(void *unused) {
             error("ERROR on accept");
             continue;
         }
+        struct wspass_t *pass = calloc(1, sizeof(struct wspass_t));
+        inet_ntop(cli_addr.sin_family, &cli_addr.sin_addr, pass->ip, sizeof(pass->ip));
         fprintf(stderr, " websocket %d: got client connection from %s\n",
                     settings.handler_id,
-                    inet_ntoa(cli_addr.sin_addr));
+                    pass->ip);
 
         pthread_t tid;
-        struct wspass_t *pass = calloc(1, sizeof(struct wspass_t));
         pass->id = settings.handler_id;
         pass->csock = csock;
         pthread_create(&tid, NULL, subthread, pass);

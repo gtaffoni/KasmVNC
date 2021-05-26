@@ -43,6 +43,7 @@ namespace rfb {
   class ListConnInfo;
   class PixelBuffer;
   class KeyRemapper;
+  class network::GetAPIMessager;
 
   class VNCServerST : public VNCServer,
                       public Timer::Callback,
@@ -94,13 +95,15 @@ namespace rfb {
     virtual void setPixelBuffer(PixelBuffer* pb, const ScreenSet& layout);
     virtual void setPixelBuffer(PixelBuffer* pb);
     virtual void setScreenLayout(const ScreenSet& layout);
-    virtual PixelBuffer* getPixelBuffer() const { return pb; }
-    virtual void serverCutText(const char* str, int len);
+    virtual PixelBuffer* getPixelBuffer() const { if (DLPRegion.enabled && blackedpb) return blackedpb; else return pb; }
+    virtual void requestClipboard();
+    virtual void announceClipboard(bool available);
+    virtual void sendClipboardData(const char* data);
     virtual void add_changed(const Region &region);
     virtual void add_copied(const Region &dest, const Point &delta);
     virtual void setCursor(int width, int height, const Point& hotspot,
                            const rdr::U8* data);
-    virtual void setCursorPos(const Point& p);
+    virtual void setCursorPos(const Point& p, bool warped);
     virtual void setLEDState(unsigned state);
 
     virtual void bell();
@@ -186,6 +189,12 @@ namespace rfb {
     bool getDisable() { return disableclients;};
     void setDisable(bool disable) { disableclients = disable;};
 
+    void setAPIMessager(network::GetAPIMessager *msgr) { apimessager = msgr; }
+
+    void handleClipboardRequest(VNCSConnectionST* client);
+    void handleClipboardAnnounce(VNCSConnectionST* client, bool available);
+    void handleClipboardData(VNCSConnectionST* client, const char* data, int len);
+
   protected:
 
     friend class VNCSConnectionST;
@@ -206,6 +215,7 @@ namespace rfb {
     bool desktopStarted;
     int blockCounter;
     PixelBuffer* pb;
+    ManagedPixelBuffer *blackedpb;
     ScreenSet screenLayout;
     unsigned int ledState;
 
@@ -213,6 +223,8 @@ namespace rfb {
 
     std::list<VNCSConnectionST*> clients;
     VNCSConnectionST* pointerClient;
+    VNCSConnectionST* clipboardClient;
+    std::list<VNCSConnectionST*> clipboardRequestors;
     std::list<network::Socket*> closingSockets;
 
     static EncCache encCache;
@@ -232,6 +244,7 @@ namespace rfb {
     void stopFrameClock();
     int msToNextUpdate();
     void writeUpdate();
+    void blackOut();
     Region getPendingRegion();
     const RenderedCursor* getRenderedCursor();
 
@@ -249,6 +262,19 @@ namespace rfb {
     bool disableclients;
 
     Timer frameTimer;
+
+    int inotifyfd;
+
+    network::GetAPIMessager *apimessager;
+
+    struct {
+        bool enabled;
+        int x1, y1, x2, y2;
+        bool percents;
+        rdr::U16 pcx1, pcy1, pcx2, pcy2;
+    } DLPRegion;
+
+    void translateDLPRegion(rdr::U16 &x1, rdr::U16 &y1, rdr::U16 &x2, rdr::U16 &y2) const;
   };
 
 };

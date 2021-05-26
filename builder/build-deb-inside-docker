@@ -1,0 +1,14 @@
+#!/bin/bash
+
+set -e
+
+cd "$(dirname "$0")/.."
+
+os=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+os_codename=$(lsb_release -cs)
+os_dir="builder/build/${os_codename}"
+
+dpkg-buildpackage -us -uc -b
+mkdir -p "$os_dir"
+cp ../*.deb "$os_dir"
+lintian ../*.deb || true

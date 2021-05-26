@@ -11,3 +11,13 @@ CMakeCache.txt
 Makefile
 Makefile.in
 config.h
+
+builder/build/
+builder/www/
+
+# Deb building artefacts
+debian/.debhelper/
+debian/files
+debian/kasmvncserver.substvars
+debian/kasmvncserver/
+.pc

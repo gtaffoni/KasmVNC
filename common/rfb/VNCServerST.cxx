@@ -51,6 +51,8 @@
 #include <assert.h>
 #include <stdlib.h>
 
+#include <network/GetAPI.h>
+
 #include <rfb/ComparingUpdateTracker.h>
 #include <rfb/KeyRemapper.h>
 #include <rfb/ListConnInfo.h>
@@ -63,6 +65,11 @@
 
 #include <rdr/types.h>
 
+#include <fcntl.h>
+#include <sys/inotify.h>
+#include <unistd.h>
+#include <wordexp.h>
+
 using namespace rfb;
 
 static LogWriter slog("VNCServerST");
@@ -73,20 +80,136 @@ EncCache VNCServerST::encCache;
 // -=- VNCServerST Implementation
 //
 
+static char kasmpasswdpath[4096];
+
 // -=- Constructors/Destructor
+
+static void mixedPercentages() {
+  slog.error("Mixing percentages and absolute values in DLP_Region is not allowed");
+  exit(1);
+}
+
+static void parseRegionPart(const bool percents, rdr::U16 &pcdest, int &dest,
+                            char **inptr) {
+  char *nextptr, *ptr;
+  ptr = *inptr;
+  int val = strtol(ptr, &nextptr, 10);
+  if (!*ptr || ptr == nextptr) {
+    slog.error("Invalid value for DLP_Region");
+    exit(1);
+  }
+  ptr = nextptr;
+  if (*ptr == '%') {
+    if (!percents)
+      mixedPercentages();
+    pcdest = val;
+
+    if (val < 0 || val > 100) {
+      slog.error("Percent must be 0-100");
+      exit(1);
+    }
+
+    ptr++;
+  } else if (percents) {
+    mixedPercentages();
+  }
+  dest = val;
+
+  for (; *ptr && *ptr == ','; ptr++);
+
+  *inptr = ptr;
+}
 
 VNCServerST::VNCServerST(const char* name_, SDesktop* desktop_)
   : blHosts(&blacklist), desktop(desktop_), desktopStarted(false),
-    blockCounter(0), pb(0), ledState(ledUnknown),
-    name(strDup(name_)), pointerClient(0), comparer(0),
-    cursor(new Cursor(0, 0, Point(), NULL)),
+    blockCounter(0), pb(0), blackedpb(0), ledState(ledUnknown),
+    name(strDup(name_)), pointerClient(0), clipboardClient(0),
+    comparer(0), cursor(new Cursor(0, 0, Point(), NULL)),
     renderedCursorInvalid(false),
     queryConnectionHandler(0), keyRemapper(&KeyRemapper::defInstance),
     lastConnectionTime(0), disableclients(false),
-    frameTimer(this)
+    frameTimer(this), apimessager(NULL)
 {
   lastUserInputTime = lastDisconnectTime = time(0);
   slog.debug("creating single-threaded server %s", name.buf);
+
+  DLPRegion.enabled = DLPRegion.percents = false;
+
+  if (Server::DLP_Region[0]) {
+    unsigned len = strlen(Server::DLP_Region);
+    unsigned i;
+    unsigned commas = 0;
+    int val;
+    char *ptr, *nextptr;
+
+    for (i = 0; i < len; i++) {
+      if (Server::DLP_Region[i] == ',')
+        commas++;
+    }
+
+    if (commas != 3) {
+      slog.error("DLP_Region must contain four values");
+      exit(1);
+    }
+
+    ptr = (char *) (const char *) Server::DLP_Region;
+
+    val = strtol(ptr, &nextptr, 10);
+    if (!*ptr || ptr == nextptr) {
+      slog.error("Invalid value for DLP_Region");
+      exit(1);
+    }
+    ptr = nextptr;
+    if (*ptr == '%') {
+      DLPRegion.percents = true;
+      DLPRegion.pcx1 = val;
+      ptr++;
+    }
+    DLPRegion.x1 = val;
+
+    for (; *ptr && *ptr == ','; ptr++);
+
+    parseRegionPart(DLPRegion.percents, DLPRegion.pcy1, DLPRegion.y1,
+                    &ptr);
+    parseRegionPart(DLPRegion.percents, DLPRegion.pcx2, DLPRegion.x2,
+                    &ptr);
+    parseRegionPart(DLPRegion.percents, DLPRegion.pcy2, DLPRegion.y2,
+                    &ptr);
+
+    // Validity checks
+    if (!DLPRegion.percents) {
+      if (DLPRegion.x1 > 0 && DLPRegion.x2 > 0 && DLPRegion.x2 <= DLPRegion.x1) {
+        slog.error("DLP_Region x2 must be > x1");
+        exit(1);
+      }
+      if (DLPRegion.y1 > 0 && DLPRegion.y2 > 0 && DLPRegion.y2 <= DLPRegion.y1) {
+        slog.error("DLP_Region y2 must be > y1");
+        exit(1);
+      }
+    }
+
+    DLPRegion.enabled = 1;
+  }
+
+  kasmpasswdpath[0] = '\0';
+  wordexp_t wexp;
+  if (!wordexp(rfb::Server::kasmPasswordFile, &wexp, WRDE_NOCMD))
+    strncpy(kasmpasswdpath, wexp.we_wordv[0], 4096);
+  kasmpasswdpath[4095] = '\0';
+  wordfree(&wexp);
+
+  if (kasmpasswdpath[0] && access(kasmpasswdpath, R_OK) == 0) {
+    // Set up a watch on the password file
+    inotifyfd = inotify_init();
+    if (inotifyfd < 0)
+      slog.error("Failed to init inotify");
+
+    int flags = fcntl(inotifyfd, F_GETFL, 0);
+    fcntl(inotifyfd, F_SETFL, flags | O_NONBLOCK);
+
+    if (inotify_add_watch(inotifyfd, kasmpasswdpath, IN_CLOSE_WRITE | IN_DELETE_SELF) < 0)
+      slog.error("Failed to set watch");
+  }
 }
 
 VNCServerST::~VNCServerST()
@@ -379,21 +502,51 @@ void VNCServerST::setScreenLayout(const ScreenSet& layout)
   }
 }
 
+void VNCServerST::requestClipboard()
+{
+  if (clipboardClient == NULL)
+    return;
+
+  clipboardClient->requestClipboard();
+}
+
+void VNCServerST::announceClipboard(bool available)
+{
+  std::list<VNCSConnectionST*>::iterator ci, ci_next;
+
+  if (available)
+    clipboardClient = NULL;
+
+  clipboardRequestors.clear();
+
+  for (ci = clients.begin(); ci != clients.end(); ci = ci_next) {
+    ci_next = ci; ci_next++;
+    (*ci)->announceClipboard(available);
+  }
+}
+
+void VNCServerST::sendClipboardData(const char* data)
+{
+  std::list<VNCSConnectionST*>::iterator ci, ci_next;
+
+  if (strchr(data, '\r') != NULL)
+    throw Exception("Invalid carriage return in clipboard data");
+
+  for (ci = clipboardRequestors.begin();
+       ci != clipboardRequestors.end(); ci = ci_next) {
+    ci_next = ci; ci_next++;
+    (*ci)->sendClipboardDataOrClose(data);
+  }
+
+  clipboardRequestors.clear();
+}
+
 void VNCServerST::bell()
 {
   std::list<VNCSConnectionST*>::iterator ci, ci_next;
   for (ci = clients.begin(); ci != clients.end(); ci = ci_next) {
     ci_next = ci; ci_next++;
     (*ci)->bellOrClose();
-  }
-}
-
-void VNCServerST::serverCutText(const char* str, int len)
-{
-  std::list<VNCSConnectionST*>::iterator ci, ci_next;
-  for (ci = clients.begin(); ci != clients.end(); ci = ci_next) {
-    ci_next = ci; ci_next++;
-    (*ci)->serverCutTextOrClose(str, len);
   }
 }
 
@@ -442,14 +595,17 @@ void VNCServerST::setCursor(int width, int height, const Point& newHotspot,
   }
 }
 
-void VNCServerST::setCursorPos(const Point& pos)
+void VNCServerST::setCursorPos(const Point& pos, bool warped)
 {
   if (!cursorPos.equals(pos)) {
     cursorPos = pos;
     renderedCursorInvalid = true;
     std::list<VNCSConnectionST*>::iterator ci;
-    for (ci = clients.begin(); ci != clients.end(); ci++)
+    for (ci = clients.begin(); ci != clients.end(); ci++) {
       (*ci)->renderedCursorChange();
+      if (warped)
+        (*ci)->cursorPositionChange();
+    }
   }
 }
 
@@ -611,6 +767,138 @@ int VNCServerST::msToNextUpdate()
     return frameTimer.getRemainingMs();
 }
 
+static void checkAPIMessages(network::GetAPIMessager *apimessager)
+{
+  if (pthread_mutex_lock(&apimessager->userMutex))
+    return;
+
+  const unsigned num = apimessager->actionQueue.size();
+  unsigned i;
+  for (i = 0; i < num; i++) {
+    slog.info("Main thread processing user API request %u/%u", i + 1, num);
+
+    const network::GetAPIMessager::action_data &act = apimessager->actionQueue[i];
+    struct kasmpasswd_t *set = NULL;
+    unsigned s;
+    bool found;
+
+    switch (act.action) {
+      case network::GetAPIMessager::USER_REMOVE:
+        set = readkasmpasswd(kasmpasswdpath);
+        found = false;
+        for (s = 0; s < set->num; s++) {
+          if (!strcmp(set->entries[s].user, act.data.user)) {
+            set->entries[s].user[0] = '\0';
+            found = true;
+            break;
+          }
+        }
+
+        if (found) {
+          writekasmpasswd(kasmpasswdpath, set);
+          slog.info("User %s removed", act.data.user);
+        } else {
+          slog.error("Tried to remove nonexistent user %s", act.data.user);
+        }
+      break;
+      case network::GetAPIMessager::USER_GIVE_CONTROL:
+        set = readkasmpasswd(kasmpasswdpath);
+        found = false;
+        for (s = 0; s < set->num; s++) {
+          if (!strcmp(set->entries[s].user, act.data.user)) {
+            set->entries[s].write = 1;
+            found = true;
+          } else {
+            set->entries[s].write = 0;
+          }
+        }
+
+        if (found) {
+          writekasmpasswd(kasmpasswdpath, set);
+          slog.info("User %s given control", act.data.user);
+        } else {
+          slog.error("Tried to give control to nonexistent user %s", act.data.user);
+        }
+      break;
+    }
+
+    if (set) {
+      free(set->entries);
+      free(set);
+    }
+  }
+
+  apimessager->actionQueue.clear();
+  pthread_mutex_unlock(&apimessager->userMutex);
+}
+
+void VNCServerST::translateDLPRegion(rdr::U16 &x1, rdr::U16 &y1, rdr::U16 &x2, rdr::U16 &y2) const
+{
+  if (DLPRegion.percents) {
+    x1 = DLPRegion.pcx1 ? DLPRegion.pcx1 * pb->getRect().width() / 100 : 0;
+    y1 = DLPRegion.pcy1 ? DLPRegion.pcy1 * pb->getRect().height() / 100 : 0;
+    x2 = DLPRegion.pcx2 ? (100 - DLPRegion.pcx2) * pb->getRect().width() / 100 : pb->getRect().width();
+    y2 = DLPRegion.pcy2 ? (100 - DLPRegion.pcy2) * pb->getRect().height() / 100 : pb->getRect().height();
+  } else {
+    x1 = abs(DLPRegion.x1);
+    y1 = abs(DLPRegion.y1);
+    x2 = pb->getRect().width();
+    y2 = pb->getRect().height();
+
+    if (DLPRegion.x2 < 0)
+      x2 += DLPRegion.x2;
+    else if (DLPRegion.x2 > 0)
+      x2 = DLPRegion.x2;
+
+    if (DLPRegion.y2 < 0)
+      y2 += DLPRegion.y2;
+    else if (DLPRegion.y2 > 0)
+      y2 = DLPRegion.y2;
+  }
+
+  if (y2 > pb->getRect().height())
+    y2 = pb->getRect().height() - 1;
+  if (x2 > pb->getRect().width())
+    x2 = pb->getRect().width() - 1;
+
+  //slog.info("DLP_Region vals %u,%u %u,%u", x1, y1, x2, y2);
+}
+
+void VNCServerST::blackOut()
+{
+  // Compute the region, since the resolution may have changed
+  rdr::U16 x1, y1, x2, y2;
+
+  translateDLPRegion(x1, y1, x2, y2);
+
+  if (blackedpb)
+    delete blackedpb;
+  blackedpb = new ManagedPixelBuffer(pb->getPF(), pb->getRect().width(), pb->getRect().height());
+
+  int stride;
+  const rdr::U8 *src = pb->getBuffer(pb->getRect(), &stride);
+  rdr::U8 *data = blackedpb->getBufferRW(pb->getRect(), &stride);
+  stride *= 4;
+
+  memcpy(data, src, stride * pb->getRect().height());
+
+  rdr::U16 y;
+  const rdr::U16 w = pb->getRect().width();
+  const rdr::U16 h = pb->getRect().height();
+  for (y = 0; y < h; y++) {
+    if (y < y1 || y > y2) {
+      memset(data, 0, stride);
+    } else {
+      if (x1)
+        memset(data, 0, x1 * 4);
+      if (x2)
+        memset(&data[x2 * 4], 0, (w - x2) * 4);
+    }
+
+    data += stride;
+  }
+}
+
 // writeUpdate() is called on a regular interval in order to see what
 // updates are pending and propagates them to the update tracker for
 // each client. It uses the ComparingUpdateTracker's compare() method
@@ -627,6 +915,11 @@ void VNCServerST::writeUpdate()
 
   assert(blockCounter == 0);
   assert(desktopStarted);
+
+  if (DLPRegion.enabled) {
+    comparer->enable_copyrect(false);
+    blackOut();
+  }
 
   comparer->getUpdateInfo(&ui, pb->getRect());
   toCheck = ui.changed.union_(ui.copied);
@@ -659,8 +952,40 @@ void VNCServerST::writeUpdate()
   encCache.clear();
   encCache.enabled = clients.size() > 1;
 
+  // Check if the password file was updated
+  bool permcheck = false;
+  if (inotifyfd >= 0) {
+    char buf[256];
+    int ret = read(inotifyfd, buf, 256);
+    int pos = 0;
+    while (ret > 0) {
+      const struct inotify_event * const ev = (struct inotify_event *) &buf[pos];
+
+      if (ev->mask & IN_IGNORED) {
+        // file was deleted, set new watch
+        if (inotify_add_watch(inotifyfd, kasmpasswdpath, IN_CLOSE_WRITE | IN_DELETE_SELF) < 0)
+          slog.error("Failed to set watch");
+      }
+
+      permcheck = true;
+
+      ret -= sizeof(struct inotify_event) - ev->len;
+      pos += sizeof(struct inotify_event) - ev->len;
+    }
+  }
+
+  if (apimessager) {
+    apimessager->mainUpdateScreen(pb);
+
+    checkAPIMessages(apimessager);
+  }
+
   for (ci = clients.begin(); ci != clients.end(); ci = ci_next) {
     ci_next = ci; ci_next++;
+
+    if (permcheck)
+      (*ci)->recheckPerms();
+
     (*ci)->add_copied(ui.copied, ui.copy_delta);
     (*ci)->add_copypassed(ui.copypassed);
     (*ci)->add_changed(ui.changed);
@@ -757,3 +1082,32 @@ bool VNCServerST::getComparerState()
   }
   return false;
 }
+
+void VNCServerST::handleClipboardRequest(VNCSConnectionST* client)
+{
+  clipboardRequestors.push_back(client);
+  if (clipboardRequestors.size() == 1)
+    desktop->handleClipboardRequest();
+}
+
+void VNCServerST::handleClipboardAnnounce(VNCSConnectionST* client,
+                                          bool available)
+{
+  if (available)
+    clipboardClient = client;
+  else {
+    if (client != clipboardClient)
+      return;
+    clipboardClient = NULL;
+  }
+  desktop->handleClipboardAnnounce(available);
+}
+
+void VNCServerST::handleClipboardData(VNCSConnectionST* client,
+                                      const char* data, int len)
+{
+  if (client != clipboardClient)
+    return;
+  desktop->handleClipboardData(data, len);
+}
+

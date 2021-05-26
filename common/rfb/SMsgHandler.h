@@ -54,7 +54,18 @@ namespace rfb {
     virtual void enableContinuousUpdates(bool enable,
                                          int x, int y, int w, int h) = 0;
 
+    virtual void handleClipboardCaps(rdr::U32 flags,
+                                     const rdr::U32* lengths);
+    virtual void handleClipboardRequest(rdr::U32 flags);
+    virtual void handleClipboardPeek(rdr::U32 flags);
+    virtual void handleClipboardNotify(rdr::U32 flags);
+    virtual void handleClipboardProvide(rdr::U32 flags,
+                                        const size_t* lengths,
+                                        const rdr::U8* const* data);
+
     virtual void sendStats() = 0;
+
+    virtual bool canChangeKasmSettings() const = 0;
 
     // InputHandler interface
     // The InputHandler methods will be called for the corresponding messages.

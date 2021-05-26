@@ -1,0 +1,31 @@
+#!/bin/bash
+
+set -e
+
+build_www_dir() {
+  local webpacked_www=$PWD/builder/www
+  local src_www=kasmweb
+
+  if [ "$src_www" -nt "$webpacked_www" ]; then
+    docker build -t kasmweb/www -f builder/dockerfile.www.build .
+    docker run --rm -v $PWD/builder/www:/build kasmweb/www:latest
+  fi
+}
+
+shared_with_docker_dir=${GITLAB_SHARED_DIND_DIR:-/tmp}
+
+cd "$(dirname "$0")/.."
+. builder/os_ver_cli.sh
+
+build_www_dir
+
+docker build -t kasmvncbuilder:$os_codename \
+  -f builder/dockerfile.${os}_${os_codename}.build .
+mkdir -p builder/build
+docker run -v $shared_with_docker_dir:/build --rm kasmvncbuilder:$os_codename
+
+L_GID=$(id -g)
+L_UID=$(id -u)
+tarball_name="kasmvnc.${os}_${os_codename}.tar.gz"
+chown $L_UID:$L_GID $shared_with_docker_dir/$tarball_name
+mv $shared_with_docker_dir/$tarball_name $PWD/builder/build/

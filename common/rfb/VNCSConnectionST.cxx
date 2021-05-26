@@ -38,12 +38,17 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <wordexp.h>
+
+#include "kasmpasswd.h"
 
 using namespace rfb;
 
 static LogWriter vlog("VNCSConnST");
 
 static Cursor emptyCursor(0, 0, Point(0, 0), NULL);
+
+extern rfb::BoolParameter disablebasicauth;
 
 VNCSConnectionST::VNCSConnectionST(VNCServerST* server_, network::Socket *s,
                                    bool reverse)
@@ -54,7 +59,7 @@ VNCSConnectionST::VNCSConnectionST(VNCServerST* server_, network::Socket *s,
     losslessTimer(this), kbdLogTimer(this), server(server_), updates(false),
     updateRenderedCursor(false), removeRenderedCursor(false),
     continuousUpdates(false), encodeManager(this, &server_->encCache),
-    pointerEventTime(0),
+    needsPermCheck(false), pointerEventTime(0),
     clientHasCursor(false),
     accessRights(AccessDefault), startTime(time(0))
 {
@@ -65,10 +70,32 @@ VNCSConnectionST::VNCSConnectionST(VNCServerST* server_, network::Socket *s,
   memset(bstats_total, 0, sizeof(bstats_total));
   gettimeofday(&connStart, NULL);
 
+  // Check their permissions, if applicable
+  kasmpasswdpath[0] = '\0';
+  wordexp_t wexp;
+  if (!wordexp(rfb::Server::kasmPasswordFile, &wexp, WRDE_NOCMD))
+    strncpy(kasmpasswdpath, wexp.we_wordv[0], 4096);
+  kasmpasswdpath[4095] = '\0';
+  wordfree(&wexp);
+
+  user[0] = '\0';
+  const char *at = strchr(peerEndpoint.buf, '@');
+  if (at && at - peerEndpoint.buf > 1 && at - peerEndpoint.buf < 32) {
+    memcpy(user, peerEndpoint.buf, at - peerEndpoint.buf);
+    user[at - peerEndpoint.buf] = '\0';
+  }
+
+  bool write, owner;
+  if (!getPerms(write, owner) || !write) {
+    accessRights &= ~WRITER_PERMS;
+  }
+
   // Configure the socket
   setSocketTimeouts();
   lastEventTime = time(0);
   gettimeofday(&lastRealUpdate, NULL);
+  gettimeofday(&lastClipboardOp, NULL);
+  gettimeofday(&lastKeyEvent, NULL);
 
   server->clients.push_front(this);
 }
@@ -127,6 +154,17 @@ void VNCSConnectionST::close(const char* reason)
 
   if (authenticated()) {
       server->lastDisconnectTime = time(0);
+  }
+
+  try {
+    if (sock->outStream().bufferUsage() > 0) {
+      sock->cork(false);
+      sock->outStream().flush();
+      if (sock->outStream().bufferUsage() > 0)
+        vlog.error("Failed to flush remaining socket data on close");
+    }
+  } catch (rdr::Exception& e) {
+    vlog.error("Failed to flush remaining socket data on close: %s", e.str());
   }
 
   // Just shutdown the socket and mark our state as closing.  Eventually the
@@ -366,7 +404,31 @@ static void keylog(unsigned keysym, const char *client) {
     flushKeylog(client);
 }
 
-void VNCSConnectionST::serverCutTextOrClose(const char *str, int len)
+void VNCSConnectionST::requestClipboardOrClose()
+{
+  try {
+    if (!(accessRights & AccessCutText)) return;
+    if (!rfb::Server::acceptCutText) return;
+    if (state() != RFBSTATE_NORMAL) return;
+    requestClipboard();
+  } catch(rdr::Exception& e) {
+    close(e.str());
+  }
+}
+
+void VNCSConnectionST::announceClipboardOrClose(bool available)
+{
+  try {
+    if (!(accessRights & AccessCutText)) return;
+    if (!rfb::Server::sendCutText) return;
+    if (state() != RFBSTATE_NORMAL) return;
+    announceClipboard(available);
+  } catch(rdr::Exception& e) {
+    close(e.str());
+  }
+}
+
+void VNCSConnectionST::sendClipboardDataOrClose(const char* data)
 {
   try {
     if (!(accessRights & AccessCutText)) return;
@@ -376,18 +438,18 @@ void VNCSConnectionST::serverCutTextOrClose(const char *str, int len)
                 sock->getPeerAddress());
       return;
     }
+    int len = strlen(data);
     const int origlen = len;
     if (rfb::Server::DLP_ClipSendMax && len > rfb::Server::DLP_ClipSendMax)
       len = rfb::Server::DLP_ClipSendMax;
-    cliplog(str, len, origlen, "sent", sock->getPeerAddress());
-    if (state() == RFBSTATE_NORMAL)
-      writer()->writeServerCutText(str, len);
+    cliplog(data, len, origlen, "sent", sock->getPeerAddress());
+    if (state() != RFBSTATE_NORMAL) return;
+    sendClipboardData(data, len);
     gettimeofday(&lastClipboardOp, NULL);
   } catch(rdr::Exception& e) {
     close(e.str());
   }
 }
-
 
 void VNCSConnectionST::setDesktopNameOrClose(const char *name)
 {
@@ -478,6 +540,15 @@ void VNCSConnectionST::renderedCursorChange()
     updateRenderedCursor = true;
     writeFramebufferUpdateOrClose();
   }
+}
+
+// cursorPositionChange() is called whenever the cursor has changed position by
+// the server.  If the client supports being informed about these changes then
+// it will arrange for the new cursor position to be sent to the client.
+
+void VNCSConnectionST::cursorPositionChange()
+{
+  setCursorPos();
 }
 
 // needRenderedCursor() returns true if this client needs the server-side
@@ -611,7 +682,7 @@ void VNCSConnectionST::setPixelFormat(const PixelFormat& pf)
   setCursor();
 }
 
-void VNCSConnectionST::pointerEvent(const Point& pos, int buttonMask)
+void VNCSConnectionST::pointerEvent(const Point& pos, int buttonMask, const bool skipClick, const bool skipRelease)
 {
   pointerEventTime = lastEventTime = time(0);
   server->lastUserInputTime = lastEventTime;
@@ -623,7 +694,23 @@ void VNCSConnectionST::pointerEvent(const Point& pos, int buttonMask)
       server->pointerClient = this;
     else
       server->pointerClient = 0;
-    server->desktop->pointerEvent(pointerEventPos, buttonMask);
+
+    bool skipclick = false, skiprelease = false;
+    if (server->DLPRegion.enabled) {
+      rdr::U16 x1, y1, x2, y2;
+      server->translateDLPRegion(x1, y1, x2, y2);
+
+      if (pos.x < x1 || pos.x >= x2 ||
+          pos.y < y1 || pos.y >= y2) {
+
+          if (!Server::DLP_RegionAllowClick)
+            skipclick = true;
+          if (!Server::DLP_RegionAllowRelease)
+            skiprelease = true;
+      }
+    }
+
+    server->desktop->pointerEvent(pointerEventPos, buttonMask, skipclick, skiprelease);
   }
 }
 
@@ -784,24 +871,6 @@ void VNCSConnectionST::keyEvent(rdr::U32 keysym, rdr::U32 keycode, bool down) {
   server->desktop->keyEvent(keysym, keycode, down);
 }
 
-void VNCSConnectionST::clientCutText(const char* str, int len)
-{
-  if (!(accessRights & AccessCutText)) return;
-  if (!rfb::Server::acceptCutText) return;
-  if (msSince(&lastClipboardOp) < (unsigned) rfb::Server::DLP_ClipDelay) {
-    vlog.info("DLP: client %s: refused to receive clipboard, too soon",
-              sock->getPeerAddress());
-    return;
-  }
-  const int origlen = len;
-  if (rfb::Server::DLP_ClipAcceptMax && len > rfb::Server::DLP_ClipAcceptMax)
-    len = rfb::Server::DLP_ClipAcceptMax;
-  cliplog(str, len, origlen, "received", sock->getPeerAddress());
-
-  gettimeofday(&lastClipboardOp, NULL);
-  server->desktop->clientCutText(str, len);
-}
-
 void VNCSConnectionST::framebufferUpdateRequest(const Rect& r,bool incremental)
 {
   Rect safeRect;
@@ -821,7 +890,7 @@ void VNCSConnectionST::framebufferUpdateRequest(const Rect& r,bool incremental)
 
   // Just update the requested region.
   // Framebuffer update will be sent a bit later, see processMessages().
-  Region reqRgn(r);
+  Region reqRgn(safeRect);
   if (!incremental || !continuousUpdates)
     requested.assign_union(reqRgn);
 
@@ -935,6 +1004,38 @@ void VNCSConnectionST::enableContinuousUpdates(bool enable,
   }
 }
 
+void VNCSConnectionST::handleClipboardRequest()
+{
+  if (!(accessRights & AccessCutText)) return;
+  server->handleClipboardRequest(this);
+}
+
+void VNCSConnectionST::handleClipboardAnnounce(bool available)
+{
+  if (!(accessRights & AccessCutText)) return;
+  if (!rfb::Server::acceptCutText) return;
+  server->handleClipboardAnnounce(this, available);
+}
+
+void VNCSConnectionST::handleClipboardData(const char* data, int len)
+{
+  if (!(accessRights & AccessCutText)) return;
+  if (!rfb::Server::acceptCutText) return;
+  if (msSince(&lastClipboardOp) < (unsigned) rfb::Server::DLP_ClipDelay) {
+    vlog.info("DLP: client %s: refused to receive clipboard, too soon",
+              sock->getPeerAddress());
+    return;
+  }
+  const int origlen = len;
+  if (rfb::Server::DLP_ClipAcceptMax && len > rfb::Server::DLP_ClipAcceptMax)
+    len = rfb::Server::DLP_ClipAcceptMax;
+  cliplog(data, len, origlen, "received", sock->getPeerAddress());
+
+  gettimeofday(&lastClipboardOp, NULL);
+  server->handleClipboardData(this, data, len);
+}
+
+
 // supportsLocalCursor() is called whenever the status of
 // cp.supportsLocalCursor has changed.  If the client does now support local
 // cursor, we make sure that the old server-side rendered cursor is cleaned up
@@ -997,6 +1098,33 @@ bool VNCSConnectionST::isShiftPressed()
     }
 
   return false;
+}
+
+bool VNCSConnectionST::getPerms(bool &write, bool &owner) const
+{
+  bool found = false;
+  if (disablebasicauth) {
+    // We're running without basicauth
+    write = true;
+    return true;
+  }
+  if (user[0]) {
+    struct kasmpasswd_t *set = readkasmpasswd(kasmpasswdpath);
+    unsigned i;
+    for (i = 0; i < set->num; i++) {
+      if (!strcmp(set->entries[i].user, user)) {
+        write = set->entries[i].write;
+        owner = set->entries[i].owner;
+        found = true;
+        break;
+      }
+    }
+
+    free(set->entries);
+    free(set);
+  }
+
+  return found;
 }
 
 void VNCSConnectionST::writeRTTPing()
@@ -1078,6 +1206,22 @@ void VNCSConnectionST::writeFramebufferUpdate()
   // bit if things are congested.
   if (isCongested())
     return;
+
+  // Check for permission changes?
+  if (needsPermCheck) {
+    needsPermCheck = false;
+
+    bool write, owner, ret;
+    ret = getPerms(write, owner);
+    if (!ret) {
+      close("User was deleted");
+      return;
+    } else if (!write) {
+      accessRights &= ~WRITER_PERMS;
+    } else {
+      accessRights |= WRITER_PERMS;
+    }
+  }
 
   // Updates often consists of many small writes, and in continuous
   // mode, we will also have small fence messages around the update. We
@@ -1383,6 +1527,21 @@ void VNCSConnectionST::setCursor()
         return;
       }
     }
+  }
+}
+
+// setCursorPos() is called whenever the cursor has changed position by the
+// server.  If the client supports being informed about these changes then it
+// will arrange for the new cursor position to be sent to the client.
+
+void VNCSConnectionST::setCursorPos()
+{
+  if (state() != RFBSTATE_NORMAL)
+    return;
+
+  if (cp.supportsCursorPosition) {
+    cp.setCursorPos(server->cursorPos);
+    writer()->writeCursorPos();
   }
 }
 
